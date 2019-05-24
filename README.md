@@ -98,7 +98,7 @@ $ /path/janus -C /path/janus.jcfg -p /path/janus.pid -L /path/janus.log -l -R -b
 
 ### RTMP pubslish
 
-Open the [demo](http://localhost:8888/)`http://localhost:8888/` , Record start! Then you can play the rtmp url with `ffplay rtmp://localhost:1935/qixi/recording-id`
+Open the [demo](http://localhost:8888/)`http://localhost:8888/` , Record start! <br/> Then you can play the rtmp url with `ffplay rtmp://localhost:1935/qixi/recording-id`
 
 
 ## Maintainers
