@@ -1,0 +1,127 @@
+diff --git a/Makefile.am b/Makefile.am
+index 85d6bee6..134d347c 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -104,6 +104,8 @@ janus_SOURCES = \
+ 	mutex.h \
+ 	record.c \
+ 	record.h \
++	live.c \
++	live.h \
+ 	refcount.h \
+ 	rtcp.c \
+ 	rtcp.h \
+@@ -141,12 +143,14 @@ janus_CFLAGS = \
+ 	-DEVENTDIR=\"$(eventdir)\" \
+ 	-DCONFDIR=\"$(confdir)\" \
+ 	$(BORINGSSL_CFLAGS) \
++	$(POST_PROCESSING_CFLAGS) \
+ 	$(NULL)
+ 
+ janus_LDADD = \
+ 	$(BORINGSSL_LIBS) \
+ 	$(JANUS_LIBS) \
+ 	$(JANUS_MANUAL_LIBS) \
++	$(POST_PROCESSING_LIBS) \
+ 	$(NULL)
+ 
+ dist_man1_MANS = janus.1
+diff --git a/conf/janus.plugin.recordplay.jcfg.sample.in b/conf/janus.plugin.recordplay.jcfg.sample.in
+index a15d1b6c..77d30232 100644
+--- a/conf/janus.plugin.recordplay.jcfg.sample.in
++++ b/conf/janus.plugin.recordplay.jcfg.sample.in
+@@ -2,6 +2,7 @@
+ # events = true|false, whether events should be sent to event handlers
+ 
+ general: {
++	rtmp = "rtmp://localhost:1935/qixi"
+ 	path = "@recordingsdir@"
+ 	#events = false
+ }
+diff --git a/plugins/janus_recordplay.c b/plugins/janus_recordplay.c
+index 1c0e4507..7b7ebfdb 100644
+--- a/plugins/janus_recordplay.c
++++ b/plugins/janus_recordplay.c
+@@ -265,6 +265,7 @@
+ #include "../config.h"
+ #include "../mutex.h"
+ #include "../record.h"
++#include "../live.h"
+ #include "../sdp-utils.h"
+ #include "../rtp.h"
+ #include "../rtcp.h"
+@@ -412,6 +413,7 @@ typedef struct janus_recordplay_session {
+ 	janus_recordplay_recording *recording;
+ 	janus_recorder *arc;	/* Audio recorder */
+ 	janus_recorder *vrc;	/* Video recorder */
++	janus_live_pub *pub;	/* live pub */
+ 	janus_mutex rec_mutex;	/* Mutex to protect the recorders from race conditions */
+ 	janus_recordplay_frame_packet *aframes;	/* Audio frames (for playout) */
+ 	janus_recordplay_frame_packet *vframes;	/* Video frames (for playout) */
+@@ -466,6 +468,7 @@ static void janus_recordplay_recording_free(const janus_refcount *recording_ref)
+ 
+ 
+ static char *recordings_path = NULL;
++static char *rtmp_path = NULL;
+ void janus_recordplay_update_recordings_list(void);
+ static void *janus_recordplay_playout_thread(void *data);
+ 
+@@ -704,6 +707,9 @@ int janus_recordplay_init(janus_callbacks *callback, const char *config_path) {
+ 		janus_config_item *path = janus_config_get(config, config_general, janus_config_type_item, "path");
+ 		if(path && path->value)
+ 			recordings_path = g_strdup(path->value);
++		janus_config_item *rtmp = janus_config_get(config, config_general, janus_config_type_item, "rtmp");
++		if(rtmp && rtmp->value)
++			rtmp_path = g_strdup(rtmp->value);
+ 		janus_config_item *events = janus_config_get(config, config_general, janus_config_type_item, "events");
+ 		if(events != NULL && events->value != NULL)
+ 			notify_events = janus_is_true(events->value);
+@@ -1173,6 +1179,7 @@ void janus_recordplay_incoming_rtp(janus_plugin_session *handle, int video, char
+ 			session->rec_vssrc = g_random_int();
+ 		header->ssrc = htonl(session->rec_vssrc);
+ 		janus_recorder_save_frame(session->vrc, buf, len);
++		janus_live_pub_save_frame(session->pub, buf, len, TRUE, 1);
+ 		/* Restore header or core statistics will be messed up */
+ 		header->ssrc = htonl(ssrc);
+ 		header->timestamp = htonl(timestamp);
+@@ -1180,6 +1187,7 @@ void janus_recordplay_incoming_rtp(janus_plugin_session *handle, int video, char
+ 	} else {
+ 		/* Save the frame if we're recording */
+ 		janus_recorder_save_frame(video ? session->vrc : session->arc, buf, len);
++		janus_live_pub_save_frame(session->pub, buf, len, video, 1);
+ 	}
+ 
+ 	janus_recordplay_send_rtcp_feedback(handle, video, buf, len);
+@@ -1264,6 +1272,13 @@ static void janus_recordplay_hangup_media_internal(janus_plugin_session *handle)
+ 		JANUS_LOG(LOG_INFO, "Closed video recording %s\n", rc->filename ? rc->filename : "??");
+ 		janus_recorder_destroy(rc);
+ 	}
++	if(session->pub) {
++		janus_live_pub *pub = session->pub;
++		session->pub = NULL;
++		janus_live_pub_close(pub);
++		JANUS_LOG(LOG_INFO, "Closed rtmp living %s\n", pub->url ? pub->url : "??");
++		janus_live_pub_destroy(pub);
++	}
+ 	janus_mutex_unlock(&session->rec_mutex);
+ 	if(session->recorder) {
+ 		if(session->recording) {
+@@ -1479,6 +1494,7 @@ static void *janus_recordplay_handler(void *data) {
+ 			/* Check which codec we should record for audio and/or video */
+ 			const char *acodec = NULL, *vcodec = NULL;
+ 			janus_sdp_find_preferred_codecs(offer, &acodec, &vcodec);
++			vcodec = "h264";
+ 			rec->acodec = janus_audiocodec_from_name(acodec);
+ 			rec->vcodec = janus_videocodec_from_name(vcodec);
+ 			/* We found preferred codecs: let's just make sure the direction is what we need */
+@@ -1533,6 +1549,10 @@ static void *janus_recordplay_handler(void *data) {
+ 				rec->vrc_file = g_strdup(filename);
+ 				session->vrc = janus_recorder_create(recordings_path, janus_videocodec_name(rec->vcodec), rec->vrc_file);
+ 			}
++			char rtmpurl[1024];
++			rtmpurl[0] = '\0';
++			g_snprintf(rtmpurl, 1024, "%s/%"SCNu64"", rtmp_path, rec->id);
++			session->pub = janus_live_pub_create(rtmpurl, janus_audiocodec_name(rec->acodec), janus_audiocodec_name(rec->vcodec));
+ 			session->recorder = TRUE;
+ 			session->recording = rec;
+ 			session->sdp_version = 1;	/* This needs to be increased when it changes */
