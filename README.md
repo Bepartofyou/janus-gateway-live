@@ -8,8 +8,8 @@
 
 This repository support now:
 
-* [x] webrtc(opus + h264) ------(push)------> rtmp (only h264)
-* [ ] webrtc(opus + h264) ------(push)------> rtmp (aac + h264)
+* [x] ~~webrtc(opus + h264) ------(push)------> rtmp (only h264)~~
+* [x] webrtc(opus + h264) ------(push)------> rtmp (aac + h264)
 * [ ] webrtc(opus + h264) <------(pull)------- rtmp (aac + h264)
 * [ ] webrtc(opus + h264) ---(multi mix + push)---> rtmp (aac + h264)
 
