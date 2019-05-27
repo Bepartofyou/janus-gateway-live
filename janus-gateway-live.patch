@@ -1,5 +1,5 @@
 diff --git a/Makefile.am b/Makefile.am
-index 85d6bee6..134d347c 100644
+index 85d6bee6..1249f8f4 100644
 --- a/Makefile.am
 +++ b/Makefile.am
 @@ -104,6 +104,8 @@ janus_SOURCES = \
@@ -11,11 +11,12 @@ index 85d6bee6..134d347c 100644
  	refcount.h \
  	rtcp.c \
  	rtcp.h \
-@@ -141,12 +143,14 @@ janus_CFLAGS = \
+@@ -141,12 +143,16 @@ janus_CFLAGS = \
  	-DEVENTDIR=\"$(eventdir)\" \
  	-DCONFDIR=\"$(confdir)\" \
  	$(BORINGSSL_CFLAGS) \
 +	$(POST_PROCESSING_CFLAGS) \
++	$(OPUS_CFLAGS) \
  	$(NULL)
  
  janus_LDADD = \
@@ -23,6 +24,7 @@ index 85d6bee6..134d347c 100644
  	$(JANUS_LIBS) \
  	$(JANUS_MANUAL_LIBS) \
 +	$(POST_PROCESSING_LIBS) \
++	$(OPUS_LIBS) \
  	$(NULL)
  
  dist_man1_MANS = janus.1
@@ -39,7 +41,7 @@ index a15d1b6c..77d30232 100644
  	#events = false
  }
 diff --git a/plugins/janus_recordplay.c b/plugins/janus_recordplay.c
-index 1c0e4507..7b7ebfdb 100644
+index 1c0e4507..73a8abbf 100644
 --- a/plugins/janus_recordplay.c
 +++ b/plugins/janus_recordplay.c
 @@ -265,6 +265,7 @@
@@ -76,7 +78,23 @@ index 1c0e4507..7b7ebfdb 100644
  		janus_config_item *events = janus_config_get(config, config_general, janus_config_type_item, "events");
  		if(events != NULL && events->value != NULL)
  			notify_events = janus_is_true(events->value);
-@@ -1173,6 +1179,7 @@ void janus_recordplay_incoming_rtp(janus_plugin_session *handle, int video, char
+@@ -996,6 +1002,7 @@ struct janus_plugin_result *janus_recordplay_handle_message(janus_plugin_session
+ 		json_t *video_keyframe_interval= json_object_get(root, "video-keyframe-interval");
+ 		if(video_keyframe_interval) {
+ 			session->video_keyframe_interval = json_integer_value(video_keyframe_interval);
++			session->video_keyframe_interval = 1000;
+ 			JANUS_LOG(LOG_VERB, "Video keyframe interval has been set to %u\n", session->video_keyframe_interval);
+ 		}
+ 		response = json_object();
+@@ -1120,6 +1127,7 @@ void janus_recordplay_send_rtcp_feedback(janus_plugin_session *handle, int video
+ 	gint64 interval = (gint64)(session->video_keyframe_interval / 1000) * G_USEC_PER_SEC;
+ 
+ 	if(elapsed >= interval) {
++		JANUS_LOG(LOG_INFO, "send pli and fir\n");
+ 		/* Send both a FIR and a PLI, just to be sure */
+ 		janus_rtcp_fir((char *)&rtcpbuf, 20, &session->video_fir_seq);
+ 		gateway->relay_rtcp(handle, video, rtcpbuf, 20);
+@@ -1173,6 +1181,7 @@ void janus_recordplay_incoming_rtp(janus_plugin_session *handle, int video, char
  			session->rec_vssrc = g_random_int();
  		header->ssrc = htonl(session->rec_vssrc);
  		janus_recorder_save_frame(session->vrc, buf, len);
@@ -84,7 +102,7 @@ index 1c0e4507..7b7ebfdb 100644
  		/* Restore header or core statistics will be messed up */
  		header->ssrc = htonl(ssrc);
  		header->timestamp = htonl(timestamp);
-@@ -1180,6 +1187,7 @@ void janus_recordplay_incoming_rtp(janus_plugin_session *handle, int video, char
+@@ -1180,6 +1189,7 @@ void janus_recordplay_incoming_rtp(janus_plugin_session *handle, int video, char
  	} else {
  		/* Save the frame if we're recording */
  		janus_recorder_save_frame(video ? session->vrc : session->arc, buf, len);
@@ -92,7 +110,7 @@ index 1c0e4507..7b7ebfdb 100644
  	}
  
  	janus_recordplay_send_rtcp_feedback(handle, video, buf, len);
-@@ -1264,6 +1272,13 @@ static void janus_recordplay_hangup_media_internal(janus_plugin_session *handle)
+@@ -1264,6 +1274,13 @@ static void janus_recordplay_hangup_media_internal(janus_plugin_session *handle)
  		JANUS_LOG(LOG_INFO, "Closed video recording %s\n", rc->filename ? rc->filename : "??");
  		janus_recorder_destroy(rc);
  	}
@@ -106,7 +124,7 @@ index 1c0e4507..7b7ebfdb 100644
  	janus_mutex_unlock(&session->rec_mutex);
  	if(session->recorder) {
  		if(session->recording) {
-@@ -1479,6 +1494,7 @@ static void *janus_recordplay_handler(void *data) {
+@@ -1479,6 +1496,7 @@ static void *janus_recordplay_handler(void *data) {
  			/* Check which codec we should record for audio and/or video */
  			const char *acodec = NULL, *vcodec = NULL;
  			janus_sdp_find_preferred_codecs(offer, &acodec, &vcodec);
@@ -114,7 +132,7 @@ index 1c0e4507..7b7ebfdb 100644
  			rec->acodec = janus_audiocodec_from_name(acodec);
  			rec->vcodec = janus_videocodec_from_name(vcodec);
  			/* We found preferred codecs: let's just make sure the direction is what we need */
-@@ -1533,6 +1549,10 @@ static void *janus_recordplay_handler(void *data) {
+@@ -1533,6 +1551,10 @@ static void *janus_recordplay_handler(void *data) {
  				rec->vrc_file = g_strdup(filename);
  				session->vrc = janus_recorder_create(recordings_path, janus_videocodec_name(rec->vcodec), rec->vrc_file);
  			}

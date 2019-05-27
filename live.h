@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <opus/opus.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 
@@ -34,12 +35,52 @@
 	#define USE_CODECPAR
 #endif
 
+#define AUDIO_MIN_SEQUENTIAL 		2
+#define AUDIO_MAX_MISORDER			50
+/* Mixer settings */
+#define AUDIO_DEFAULT_PREBUFFERING	6
+/* Opus settings */
+#define	AUDIO_BUFFER_SAMPLES		8000
+#define	AUDIO_OPUS_SAMPLES			960
+#define AUDIO_DEFAULT_COMPLEXITY	4
+
 #define JANUS_LIVE_BUFFER_MAX  2 * 1024 * 1024
 #define htonll(x) ((1==htonl(1)) ? (x) : ((gint64)htonl((x) & 0xFFFFFFFF) << 32) | htonl((x) >> 32))
 #define ntohll(x) ((1==ntohl(1)) ? (x) : ((gint64)ntohl((x) & 0xFFFFFFFF) << 32) | ntohl((x) >> 32))
 
+typedef struct janus_rtp_jb			janus_rtp_jb;
 typedef struct janus_live_pub 		janus_live_pub;
 typedef struct janus_live_el 		janus_live_el;
+
+
+typedef struct janus_adecoder_opus {
+	uint8_t 			channels;
+	uint32_t 			sampling_rate;		/* Sampling rate (e.g., 16000 for wideband; can be 8, 12, 16, 24 or 48kHz) */
+	OpusDecoder 		*decoder;			/* Opus decoder instance */
+
+	gboolean 			fec;				/* Opus FEC status */
+	uint16_t 			expected_seq;		/* Expected sequence number */
+	uint16_t 			probation; 			/* Used to determine new ssrc validity */
+	uint32_t 			last_timestamp;		/* Last in seq timestamp */
+	
+	janus_rtp_jb		*jb;
+} janus_adecoder_opus;
+
+
+typedef struct janus_aencoder_fdkaac {
+	int 				sample_rate;
+	int 				channels;
+	int 				bitrate;
+	AVFrame				*aframe;
+	AVPacket			*apacket;
+	AVCodec				*acodec;
+    AVCodecContext		*actx;
+
+	int					nb_samples;
+	int					buflen;
+	char				*buffer;
+	janus_rtp_jb		*jb;
+} janus_aencoder_fdkaac;
 
 
 typedef struct janus_frame_packet {
@@ -83,6 +124,10 @@ typedef struct janus_rtp_jb {
 	uint8_t 						*received_frame;
 	uint64_t 						ts;
 	janus_live_pub 					*pub;
+	janus_adecoder_opus				*adecoder;
+	janus_aencoder_fdkaac			*aencoder;
+	uint32_t						lastts;
+	uint32_t						offset;
 	
 	uint32_t 						size;
 	janus_frame_packet 				*list;
@@ -119,9 +164,13 @@ typedef struct janus_live_pub {
 	gboolean 						init_flag;
 	AVFormatContext 				*fctx;
 	AVStream 						*vStream;
+	AVStream 						*aStream;
 #ifdef USE_CODECPAR
 	AVCodecContext 					*vEncoder;
+	AVCodecContext 					*aEncoder;
 #endif
+	AVBitStreamFilterContext		*aacbsf;
+	uint32_t 						lastts;
 
 	janus_mutex 					mutex;
 	janus_mutex 					mutex_live;

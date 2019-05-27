@@ -32,6 +32,14 @@ static void janus_live_h264_parse_sps(char *buffer, int *width, int *height);
 static void janus_live_rtp_unpack(janus_rtp_jb *jb, janus_frame_packet *packet, gboolean video);
 static int janus_live_packet_insert(janus_live_pub *pub, janus_frame_packet *p);
 
+static janus_adecoder_opus *janus_live_opus_decoder_create(uint32_t samplerate, int channels, gboolean fec);
+static void janus_live_opus_decoder_destory(janus_adecoder_opus *dc);
+static void janus_live_opus_decoder_decode(janus_adecoder_opus *dc, char *buf, int len);
+static janus_aencoder_fdkaac *janus_live_fdkaac_encoder_create(int sample_rate, int channels, int bitrate);
+static void janus_live_fdkaac_encoder_destory(janus_aencoder_fdkaac *ec);
+static void janus_live_fdkaac_encoder_encode(janus_aencoder_fdkaac *ec, char *data, int len, uint32_t pts);
+static void janus_live_fdkaac_encoder_encode_inernal(janus_aencoder_fdkaac *ec, char *data, int len, uint32_t pts);
+
 
 janus_live_pub *
 janus_live_pub_create(const char *url, const char *acodec, const char *vcodec)
@@ -60,6 +68,10 @@ janus_live_pub_create(const char *url, const char *acodec, const char *vcodec)
         pub->audio_jb = g_malloc0(sizeof(janus_rtp_jb));
         pub->audio_jb->tb = 48000;
         pub->audio_jb->pub = pub;
+        pub->audio_jb->adecoder = janus_live_opus_decoder_create(48000, 2, TRUE);
+        pub->audio_jb->adecoder->jb = pub->audio_jb;
+        pub->audio_jb->aencoder = janus_live_fdkaac_encoder_create(48000, 2, 128);
+        pub->audio_jb->aencoder->jb = pub->audio_jb;
     }
     if(pub->vcodec) {
         pub->video_jb = g_malloc0(sizeof(janus_rtp_jb));
@@ -413,6 +425,9 @@ janus_rtp_jb_handle(gpointer user_data)
             int len = 0;
             char *buffer = janus_rtp_payload(head->data, head->len, &len);
             JANUS_LOG(LOG_INFO, "audio frame len: %d\n", len);
+            if(jb->adecoder){
+                janus_live_opus_decoder_decode(jb->adecoder, head->data, head->len);
+            }
 
             janus_packet_free(head);
             head = tmp;
@@ -465,7 +480,6 @@ janus_rtp_jb_handle(gpointer user_data)
                 }
 
                 janus_live_rtp_unpack(pub->video_jb, head, TRUE);
-
                 pub->video_jb->ts = head->ts;
             }
             janus_packet_free(head);
@@ -689,22 +703,44 @@ janus_live_send_handle(gpointer user_data)
                     gap/1000, timetout/1000, pub->size);
             
             if(head->len > 0) {
-                /* Save the frame */
-                AVPacket packet;
-                av_init_packet(&packet);
-                packet.stream_index = 0;
-                packet.data = head->data;
-                packet.size = head->len;
-                if(head->keyFrame)
-                    packet.flags |= AV_PKT_FLAG_KEY;
+                if(head->video){
+                    /* Save the frame */
+                    AVPacket *packet = av_packet_alloc();
+                    av_init_packet(packet);
+                    packet->stream_index = 0;
+                    packet->data = head->data;
+                    packet->size = head->len;
+                    if(head->keyFrame)
+                        packet->flags |= AV_PKT_FLAG_KEY;
 
-                packet.dts = (uint32_t)head->ts;
-                packet.pts = (uint32_t)head->ts;
-                if(pub->fctx) {
-                    int res = av_write_frame(pub->fctx, &packet);
-                    if(res < 0) {
-                        JANUS_LOG(LOG_ERR, "Error writing video frame to file... (error %d)\n", res);
+                    packet->dts = (uint32_t)head->ts;
+                    packet->pts = (uint32_t)head->ts;
+                    if(pub->fctx) {
+                        int res = av_interleaved_write_frame(pub->fctx, packet);
+                        if(res < 0) {
+                            JANUS_LOG(LOG_ERR, "Error writing video frame to file... (error %d)\n", res);
+                        }
                     }
+                    av_packet_free(&packet);
+                    JANUS_LOG(LOG_INFO, "rtmp video packet (len:%d) tb:%d pts:%d listsize:%d\n", head->len, pub->vStream->time_base.den, head->ts, pub->size);
+                }else{
+                    AVPacket *packet = av_packet_alloc();
+                    av_init_packet(packet);
+                    packet->stream_index = 1;
+                    packet->data = head->data;
+                    packet->size = head->len;
+                    packet->dts = (uint32_t)head->ts;
+                    packet->pts = (uint32_t)head->ts;
+                    av_bitstream_filter_filter(pub->aacbsf, pub->aStream->codec, NULL, &packet->data, &packet->size, packet->data, packet->size, 0);
+                    if(pub->fctx) {
+                        int res = av_write_frame(pub->fctx, packet);
+                        if(res < 0) {
+                            JANUS_LOG(LOG_ERR, "Error writing audio frame to file... (error %d)\n", res);
+                        }
+                    }
+                    av_free(packet->data); /* https://blog.csdn.net/bikeytang/article/details/60883987# */
+                    av_packet_free(&packet);
+                    JANUS_LOG(LOG_INFO, "rtmp audio packet (len:%d) tb:%d pts:%d listsize:%d\n", head->len, pub->aStream->time_base.den, head->ts, pub->size);
                 }
             }
         
@@ -729,6 +765,8 @@ janus_live_ffmpeg_free(janus_live_pub *pub)
 #ifdef USE_CODECPAR
 	if(pub->vEncoder != NULL)
 		avcodec_close(pub->vEncoder);
+    if(pub->aEncoder != NULL)
+		avcodec_close(pub->aEncoder);
 #else
 	if(pub->vStream != NULL && pub->vStream->codec != NULL)
 		avcodec_close(pub->vStream->codec);
@@ -739,12 +777,17 @@ janus_live_ffmpeg_free(janus_live_pub *pub)
 		av_free(pub->fctx->streams[0]->codec);
 #endif
 		av_free(pub->fctx->streams[0]);
+        av_free(pub->fctx->streams[1]);
 	}
 
 	if(pub->fctx != NULL) {
 		avio_close(pub->fctx->pb);
         av_free(pub->fctx);
 	}
+    if(pub->aacbsf != NULL) {
+        av_bitstream_filter_close(pub->aacbsf);
+        pub->aacbsf = NULL;
+    }
     return 0;
 }
 
@@ -761,6 +804,11 @@ janus_live_ffmpeg_init(janus_live_pub *pub)
 				(janus_log_level == LOG_WARN ? AV_LOG_WARNING :
 					(janus_log_level == LOG_INFO ? AV_LOG_INFO :
 						(janus_log_level == LOG_VERB ? AV_LOG_VERBOSE : AV_LOG_DEBUG))))));
+    pub->aacbsf = av_bitstream_filter_init("aac_adtstoasc");
+    if(pub->aacbsf == NULL) {
+		JANUS_LOG(LOG_ERR, "Error allocating aac_adtstoasc\n");
+		return -1;
+	}
 	/* rtmp output */
 	pub->fctx = avformat_alloc_context();
 	if(pub->fctx == NULL) {
@@ -778,6 +826,7 @@ janus_live_ffmpeg_init(janus_live_pub *pub)
 	}
 	snprintf(pub->fctx->filename, sizeof(pub->fctx->filename), "%s", pub->url);
 #ifdef USE_CODECPAR
+    /*video */
 	AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_H264);
 	if(!codec) {
 		/* Error opening video codec */
@@ -787,7 +836,8 @@ janus_live_ffmpeg_init(janus_live_pub *pub)
 	pub->fctx->video_codec = codec;
 	pub->fctx->oformat->video_codec = codec->id;
 	pub->vStream = avformat_new_stream(pub->fctx, codec);
-	pub->vStream->id = pub->fctx->nb_streams - 1;
+	// pub->vStream->id = pub->fctx->nb_streams - 1;
+    pub->vStream->id = 0;
 	pub->vEncoder = avcodec_alloc_context3(codec);
 	pub->vEncoder->width = pub->max_width;
 	pub->vEncoder->height = pub->max_height;
@@ -800,6 +850,36 @@ janus_live_ffmpeg_init(janus_live_pub *pub)
 		return -1;
 	}
 	avcodec_parameters_from_context(pub->vStream->codecpar, pub->vEncoder);
+
+    /*audio */
+    AVCodec *acodec = avcodec_find_encoder_by_name("libfdk_aac");
+	if(!acodec) {
+		/* Error opening video codec */
+		JANUS_LOG(LOG_ERR, "Encoder not available\n");
+		return -1;
+	}
+    pub->fctx->audio_codec = acodec;
+	pub->fctx->oformat->audio_codec = acodec->id;
+	pub->aStream = avformat_new_stream(pub->fctx, acodec);
+	//pub->vStream->id = pub->fctx->nb_streams-1;
+    pub->aStream->id = 1;
+	pub->aEncoder = avcodec_alloc_context3(acodec);
+    pub->aEncoder->codec_type = AVMEDIA_TYPE_AUDIO;
+    pub->aEncoder->sample_rate = 48000;
+    pub->aEncoder->bit_rate = 128 * 1000;
+    pub->aEncoder->bit_rate_tolerance = 128 * 1000 * 3 / 2;
+    pub->aEncoder->channels = 2;
+    pub->aEncoder->channel_layout = AV_CH_LAYOUT_STEREO;
+    pub->aEncoder->time_base.num = 1;
+    pub->aEncoder->time_base.den = pub->aEncoder->sample_rate;
+    pub->aEncoder->sample_fmt = AV_SAMPLE_FMT_S16;
+	pub->aEncoder->flags |= CODEC_FLAG_GLOBAL_HEADER;
+	if(avcodec_open2(pub->aEncoder, acodec, NULL) < 0) {
+		/* Error opening video codec */
+		JANUS_LOG(LOG_ERR, "Encoder error\n");
+		return -1;
+	}
+	avcodec_parameters_from_context(pub->aStream->codecpar, pub->aEncoder);
 #else
 
 	pub->vStream = avformat_new_stream(pub->fctx, 0);
@@ -995,6 +1075,7 @@ janus_live_rtp_header_extension_parse_video_orientation(char *buf, int len, int 
 void
 janus_live_pub_free(const janus_refcount *pub_ref)
 {
+    janus_frame_packet *tmp = NULL, *head = NULL;
 	janus_live_pub *pub = janus_refcount_containerof(pub_ref, janus_live_pub, ref);
 	/* This pub can be destroyed, free all the resources */
     if(!pub->closed)
@@ -1013,8 +1094,19 @@ janus_live_pub_free(const janus_refcount *pub_ref)
 
     janus_rtp_jb_free(pub);
     janus_live_ffmpeg_free(pub);
+    head = pub->list;
+    while(head){
+        tmp = head->next;
+        if(tmp){
+            tmp->prev = NULL;
+        }
+        head->next = NULL;
+        pub->size--;
+        janus_packet_free(head);
+        head = tmp;
+    }
+    JANUS_LOG(LOG_WARN, "janus live pusblish release, list:%d\n", pub->size);
 	g_free(pub);
-    JANUS_LOG(LOG_WARN, "janus live pusblish release\n");
 }
 
 
@@ -1187,4 +1279,300 @@ janus_live_h264_parse_sps(char *buffer, int *width, int *height)
 		*width = ((pic_width_in_mbs_minus1 +1)*16) - frame_crop_left_offset*2 - frame_crop_right_offset*2;
 	if(height)
 		*height = ((2 - frame_mbs_only_flag)* (pic_height_in_map_units_minus1 +1) * 16) - (frame_crop_top_offset * 2) - (frame_crop_bottom_offset * 2);
+}
+
+
+janus_adecoder_opus *
+janus_live_opus_decoder_create(uint32_t samplerate, int channels, gboolean fec)
+{
+    int error = 0;
+    janus_adecoder_opus *dc = g_malloc0(sizeof(janus_adecoder_opus));
+	dc->channels = channels;
+    dc->sampling_rate = samplerate;
+    dc->fec = FALSE;
+    dc->expected_seq = 0;
+    dc->probation = 0;
+    dc->last_timestamp = 0;
+    dc->decoder = opus_decoder_create(dc->sampling_rate, dc->channels, &error);
+    if(error != OPUS_OK) {
+	    JANUS_LOG(LOG_ERR, "Error create Opus decoder...\n");
+        g_free(dc);
+        return NULL;
+    }
+
+    if(fec){
+        dc->fec = TRUE;
+        dc->probation = AUDIO_MIN_SEQUENTIAL;
+    }
+    
+    return dc;
+}
+
+
+void
+janus_live_opus_decoder_destory(janus_adecoder_opus *dc)
+{
+    if(dc){
+        opus_decoder_destroy(dc);
+        g_free(dc);
+    }
+}
+
+
+void
+janus_live_opus_decoder_decode(janus_adecoder_opus *dc, char *buf, int len)
+{
+    janus_rtp_header *rtp = (janus_rtp_header *)buf;
+    uint32_t ssrc = ntohl(rtp->ssrc);
+	uint32_t timestamp = ntohl(rtp->timestamp);
+	uint16_t seq_number = ntohs(rtp->seq_number);
+    /* First check if probation period */
+    if(dc->probation == AUDIO_MIN_SEQUENTIAL) {
+        dc->probation--;
+        dc->expected_seq = seq_number + 1;
+        JANUS_LOG(LOG_INFO, "Probation started with ssrc = %"SCNu32", seq = %"SCNu16" \n", ssrc, seq_number);
+        return;
+    } else if(dc->probation != 0) {
+        /* Decrease probation */
+        dc->probation--;
+        if(!dc->probation){
+            /* Probation is ended */
+            JANUS_LOG(LOG_INFO, "Probation ended with ssrc = %"SCNu32", seq = %"SCNu16" \n",ssrc, seq_number);
+        }
+        dc->expected_seq = seq_number + 1;
+        return;
+    }
+
+    int plen = 0;
+    const unsigned char *payload = (const unsigned char *)janus_rtp_payload(buf, len, &plen);
+    if(!payload) {
+        JANUS_LOG(LOG_ERR, "[Opus] Ops! got an error accessing the RTP payload\n");
+        return;
+    }
+
+    gint length = 0;
+    char data[AUDIO_BUFFER_SAMPLES*2];
+    memset(data, 0, AUDIO_BUFFER_SAMPLES*2);
+    /* Check sequence number received, verify if it's relevant to the expected one */
+    if(seq_number == dc->expected_seq) {
+        /* Regular decode */
+        length = opus_decode(dc->decoder, payload, plen, (opus_int16 *)data, AUDIO_BUFFER_SAMPLES, 0);
+        /* Update last_timestamp */
+        dc->last_timestamp = timestamp;
+        /* Increment according to previous seq_number */
+        dc->expected_seq = seq_number + 1;        
+    } else if(seq_number > dc->expected_seq) {
+        /* Sequence(s) losts */
+        uint16_t gap = seq_number - dc->expected_seq;
+        JANUS_LOG(LOG_HUGE, "%"SCNu16" sequence(s) lost, sequence = %"SCNu16",  expected seq = %"SCNu16" \n",
+            gap, seq_number, dc->expected_seq);
+
+        /* Use FEC if sequence lost < DEFAULT_PREBUFFERING */
+        uint16_t start_lost_seq = dc->expected_seq;
+        if(dc->fec && gap < AUDIO_DEFAULT_PREBUFFERING) {
+            uint8_t i=0;
+            for(i=1; i<=gap ; i++) {
+                int32_t output_samples;
+                uint32_t timestamp_tmp = dc->last_timestamp + (i * AUDIO_OPUS_SAMPLES);
+                uint16_t seq_number_tmp = start_lost_seq++;
+                length = 0;
+                if(i == gap) {
+                    /* Attempt to decode with in-band FEC from next packet */
+                    opus_decoder_ctl(dc->decoder, OPUS_GET_LAST_PACKET_DURATION(&output_samples));
+                    length = opus_decode(dc->decoder, payload, plen, (opus_int16 *)data, output_samples, 1);
+                } else {
+                    opus_decoder_ctl(dc->decoder, OPUS_GET_LAST_PACKET_DURATION(&output_samples));
+                    length = opus_decode(dc->decoder, NULL, plen, (opus_int16 *)data, output_samples, 1);
+                }
+                if(length < 0) {
+                    JANUS_LOG(LOG_ERR, "[Opus] Ops! got an error decoding the Opus frame: %d (%s)\n", length, opus_strerror(length));
+                    return;
+                }
+                JANUS_LOG(LOG_HUGE, "[Opus] decoding  Opus frame len: %d, fec\n", length*dc->channels);
+                janus_live_fdkaac_encoder_encode(dc->jb->aencoder, data, length * dc->channels * sizeof(opus_int16), timestamp_tmp/(dc->jb->tb/1000));
+            }
+        }
+        /* Then go with the regular decode (no FEC) */
+        length = opus_decode(dc->decoder, payload, plen, (opus_int16 *)data, AUDIO_BUFFER_SAMPLES, 0);
+        /* Increment according to previous seq_number */
+        dc->expected_seq = seq_number + 1;
+    } else {
+        /* In late sequence or sequence wrapped */
+        if((dc->expected_seq - seq_number) > AUDIO_MAX_MISORDER){
+            JANUS_LOG(LOG_HUGE, "SN WRAPPED seq =  %"SCNu16", expected_seq =  %"SCNu16" \n", seq_number, dc->expected_seq);
+            dc->expected_seq = seq_number + 1;
+        } else {
+            JANUS_LOG(LOG_HUGE, "IN LATE SN seq =  %"SCNu16", expected_seq =  %"SCNu16" \n", seq_number, dc->expected_seq);
+        }
+        return;
+    }
+    if(length < 0) {
+        JANUS_LOG(LOG_ERR, "[Opus] Ops! got an error decoding the Opus frame: %d (%s)\n", length, opus_strerror(length));
+        return;
+    }
+    JANUS_LOG(LOG_VERB, "[Opus] decoding  Opus frame len: %d\n", length*dc->channels);
+    janus_live_fdkaac_encoder_encode(dc->jb->aencoder, data, length * dc->channels * sizeof(opus_int16), timestamp/(dc->jb->tb/1000));
+}
+
+
+janus_aencoder_fdkaac *
+janus_live_fdkaac_encoder_create(int sample_rate, int channels, int bitrate)
+{
+    janus_aencoder_fdkaac *ec = g_malloc0(sizeof(janus_aencoder_fdkaac));
+    ec->sample_rate = sample_rate;
+    ec->channels = channels;
+    ec->bitrate = bitrate;
+
+    AVDictionary *audio_opt_p = NULL;
+    ec->acodec = avcodec_find_encoder_by_name("libfdk_aac");
+    if (ec->acodec == NULL) {
+        JANUS_LOG(LOG_ERR, "init audio encoder avcodec_find_encoder_by_name aac error\n");
+        return NULL;
+    }
+    ec->actx = avcodec_alloc_context3(ec->acodec);
+    ec->actx->codec_type = AVMEDIA_TYPE_AUDIO;
+    ec->actx->sample_rate = ec->sample_rate;
+    ec->actx->bit_rate = ec->bitrate * 1000;
+    ec->actx->bit_rate_tolerance = ec->bitrate * 1000 * 3 / 2;
+    ec->actx->channels = ec->channels;
+    ec->actx->channel_layout = AV_CH_LAYOUT_STEREO;
+
+    if (ec->actx->channels == 2) {
+        ec->actx->channel_layout = AV_CH_LAYOUT_STEREO;
+    }
+    if (ec->actx->channels == 6) {
+        ec->actx->channel_layout = AV_CH_LAYOUT_5POINT1_BACK;
+    }
+    if (ec->actx->channels == 8) {
+        ec->actx->channel_layout = AV_CH_LAYOUT_7POINT1;
+    }
+    ec->actx->time_base.num = 1;
+    ec->actx->time_base.den = ec->sample_rate;
+    ec->actx->sample_fmt = AV_SAMPLE_FMT_S16;
+
+    av_dict_set(&audio_opt_p, "profile", "aac_low", 0);
+    av_dict_set(&audio_opt_p, "threads", "1", 0);
+    int ret = 0;
+    if ((ret = avcodec_open2(ec->actx, ec->acodec, &audio_opt_p)) < 0) {
+        av_dict_free(&audio_opt_p);
+        JANUS_LOG(LOG_ERR, "init audio encoder open audio encoder failed. ret=%d\n", ret);
+        return NULL;
+    }
+    av_dict_free(&audio_opt_p);
+
+    ec->nb_samples = 1024;
+    ec->aframe = av_frame_alloc();
+    ec->aframe->nb_samples     = ec->nb_samples;
+    ec->aframe->channel_layout = 3;
+    ec->aframe->format         = AV_SAMPLE_FMT_S16;
+
+    ret = av_frame_get_buffer(ec->aframe, 32);
+    if (ret != 0) {
+        JANUS_LOG(LOG_ERR, "init audio frame failed. nb_samples=%d, channel_layout=%d, ret=%d\n",
+            ec->nb_samples,ec->aframe->channel_layout, ret);
+    }
+    JANUS_LOG(LOG_ERR, "init audio frame failed. nb_samples=%d, channels=%d, format=%d, linesize0=%d\n",
+        ec->aframe->nb_samples, ec->aframe->channels, ec->aframe->format, ec->aframe->linesize[0]);
+
+    ec->buflen = 0;
+    JANUS_LOG(LOG_ERR, "fdkaac frame buffer len:%d\n", ec->nb_samples * ec->aframe->channels * 2);
+    ec->buffer = g_malloc0(ec->nb_samples * ec->aframe->channels * 2);
+
+    return ec;
+}
+
+
+void
+janus_live_fdkaac_encoder_destory(janus_aencoder_fdkaac *ec)
+{
+    if (ec->aframe) {
+        av_frame_free(&ec->aframe);
+        ec->aframe = NULL;
+    }
+    if(ec->actx) {
+        avcodec_close(ec->actx);
+        av_free(ec->actx);
+        ec->actx = NULL;
+        ec->acodec = NULL;
+    }
+    if(ec->buffer){
+        g_free(ec->buffer);
+        ec->buffer = NULL;
+    }
+    g_free(ec);
+}
+
+
+void
+janus_live_fdkaac_encoder_encode_inernal(janus_aencoder_fdkaac *ec, char *data, int len, uint32_t pts)
+{
+    if(!data || !len)
+        return;
+    gint64 now = janus_get_real_time();
+    JANUS_LOG(LOG_HUGE, "fdkaac encode len:%d, pts:%d\n", len, pts);
+    if(pts > 0 && ec->jb->lastts > 0 && pts < ec->jb->lastts && ec->jb->lastts - pts > 500){
+        JANUS_LOG(LOG_WARN, "fdkaac offset reset, last:%d, now:%d\n", ec->jb->offset, ec->jb->lastts);
+        ec->jb->offset = ec->jb->lastts;
+    }
+    ec->jb->lastts = pts;
+
+    ec->aframe->pts = pts + ec->jb->offset;
+    memcpy((unsigned char *)ec->aframe->data[0], data, len);
+
+    int got_pic = 0;
+    int ret_enc = 0;
+    AVPacket* enc_pkt_p = av_packet_alloc();
+    av_init_packet(enc_pkt_p);
+
+    ret_enc = avcodec_encode_audio2(ec->actx, enc_pkt_p, ec->aframe, &got_pic);
+    if (ret_enc < 0) {
+        JANUS_LOG(LOG_ERR, "audio encode error ret:%d\n", ret_enc);
+    }
+    if ((ret_enc >= 0) && got_pic) {
+
+        if(enc_pkt_p->pts != enc_pkt_p->dts){
+            JANUS_LOG(LOG_WARN, "audio encode erroraudio pts:%d != dts:%d\n", enc_pkt_p->pts, enc_pkt_p->dts);
+        }
+        if(AV_NOPTS_VALUE == enc_pkt_p->pts || enc_pkt_p->pts < 0){
+            JANUS_LOG(LOG_WARN, "audio pts unnormal dts:%d, pts:%d\n", enc_pkt_p->dts, enc_pkt_p->pts);
+            enc_pkt_p->pts = 0;
+            enc_pkt_p->dts = 0;
+        }
+        JANUS_LOG(LOG_HUGE, "audio pts  dts:%d, pts:%d src pts:%d\n", enc_pkt_p->dts, enc_pkt_p->pts, pts);
+
+        //janus_frame_packet *p = janus_packet_alloc(enc_pkt_p->size + FF_INPUT_BUFFER_PADDING_SIZE);
+        janus_frame_packet *p = janus_packet_alloc(enc_pkt_p->size);
+        p->created = now;
+        memcpy(p->data, enc_pkt_p->data, enc_pkt_p->size);
+        p->video = FALSE;
+        p->ts = enc_pkt_p->dts;
+        janus_live_packet_insert(ec->jb->pub, p);
+    }
+    av_packet_free(&enc_pkt_p);
+}
+
+
+void
+janus_live_fdkaac_encoder_encode(janus_aencoder_fdkaac *ec, char *data, int len, uint32_t pts)
+{
+    if(!data || !len)
+        return;
+
+    int total = ec->nb_samples * ec->aframe->channels * 2;
+    int left = 0;
+    if(ec->buflen + len < total){
+        memcpy(ec->buffer + ec->buflen, data, len);
+        ec->buflen += len;
+    } else{
+        left = len - (total - ec->buflen);
+        memcpy(ec->buffer + ec->buflen, data, total - ec->buflen);
+        janus_live_fdkaac_encoder_encode_inernal(ec, ec->buffer, total, pts);
+        ec->buflen = 0;
+
+        if(left > 0){
+            memcpy(ec->buffer + ec->buflen, &data[len - left], left);
+            ec->buflen += left;
+        }
+    }
+    JANUS_LOG(LOG_HUGE, "fdkaac cache buflen:%d, len:%d, pts:%d, left:%d\n", ec->buflen, len, pts, left);
 }
