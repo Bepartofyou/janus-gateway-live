@@ -103,7 +103,7 @@ Open the [demo](http://localhost:8888/)`http://localhost:8888/` , Record start! 
 
 ## Maintainers
 
-[@Bepartofyou](https://github.com/RichardLitt).
+[@Bepartofyou](https://github.com/Bepartofyou).
 
 ## Contributing
 
