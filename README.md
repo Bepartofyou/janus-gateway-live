@@ -1,5 +1,3 @@
-[![janus-gateway-live's github stats](https://github-readme-stats.vercel.app/api?username=Bepartofyou)](https://github.com/Bepartofyou/janus-gateway-live)
-
 # Janus-gateway live
 
 [![janus-gateway-live compliant](https://img.shields.io/badge/rtmp%20live-janus--gateway-brightgreen.svg)](https://github.com/Bepartofyou/janus-gateway-live)
